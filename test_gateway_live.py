@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import random
 import socket
 import sys
 import threading
@@ -28,11 +30,21 @@ from typing import Any, Callable
 import httpx
 import uvicorn
 
-from llm_gateway.adapters.provider import ProviderDispatcher
+from llm_gateway.adapters.provider import (
+    AnthropicProvider,
+    OpenAICompatibleProvider,
+    OpenAIResponsesProvider,
+    ProviderDispatcher,
+)
 from llm_gateway.api.app import create_app
-from llm_gateway.config import MODEL_CONFIGS
+from llm_gateway.config import MODEL_CONFIGS, ModelConfig
 from llm_gateway.errors import GatewayError
-from llm_gateway.models import Usage
+from llm_gateway.models import Message, Usage
+from llm_gateway.services.rate_limiter import (
+    DEFAULT_MAX_REQUESTS,
+    DEFAULT_WINDOW_SECONDS,
+    model_rate_limiter,
+)
 
 # ---------------------------------------------------------------------------
 # 准备：端口、凭据环境变量
@@ -121,9 +133,13 @@ class FakeUpstream:
         )
         self._check(config)
         for index, delta in enumerate(self.stream_deltas):
+            # 每个 delta 之间注入 1ms 以内的随机延迟，模拟真实流式节奏
+            await asyncio.sleep(random.uniform(0, 0.1))
             yield delta
             if self.stream_fail_after is not None and index + 1 >= self.stream_fail_after:
                 raise httpx.ConnectError("mid-stream failure")
+        # 与真实适配器契约一致：流正常结束时最后 yield 上报 usage
+        yield Usage(input_tokens=12, output_tokens=34)
 
 
 FAKE = FakeUpstream()
@@ -190,6 +206,7 @@ def error_code(body: dict[str, Any]) -> str:
 def run_scenario(name: str, func: Callable[[], None]) -> None:
     print(f"\n====== 场景: {name} ======")
     FAKE.reset()
+    model_rate_limiter.reset()
     try:
         func()
         PASSED.append(name)
@@ -370,6 +387,26 @@ def scenario_stream_success() -> None:
     check("text/event-stream" in response.headers.get("content-type", ""), "应返回 text/event-stream")
     check("".join(deltas) == "Hello from fake upstream", f"流式拼接结果不符合预期: {''.join(deltas)}")
     check(len(completed) == 1 and completed[0].get("model") == "general-primary", "应包含 response.completed 且 model 正确")
+    # TTFT：首个非空 delta 时间已在 completed 事件与审计中记录
+    completed_event = completed[0]
+    check(
+        isinstance(completed_event.get("ttft_ms"), int) and completed_event["ttft_ms"] >= 0,
+        f"response.completed 应携带 ttft_ms: {completed_event.get('ttft_ms')}",
+    )
+    # 流式 Token：上游 usage 已随 completed 下发并写入审计
+    check(
+        completed_event.get("usage") == {"input_tokens": 12, "output_tokens": 34},
+        f"response.completed 应携带上游 usage: {completed_event.get('usage')}",
+    )
+    last_trace = get("/v1/traces").json()[-1]
+    show(
+        "最新审计记录",
+        {k: last_trace[k] for k in ("input_tokens", "output_tokens", "ttft_ms", "cost_usd")},
+    )
+    check(last_trace.get("output_tokens") == 34, f"审计应记录流式 output_tokens=34: {last_trace.get('output_tokens')}")
+    check(last_trace.get("input_tokens") == 12, f"审计应记录流式 input_tokens=12: {last_trace.get('input_tokens')}")
+    check(isinstance(last_trace.get("ttft_ms"), int), "审计应记录流式 ttft_ms")
+    check(last_trace.get("cost_usd", 0) > 0, "流式审计应按真实 usage 计算成本")
 
 
 def scenario_stream_mid_failure() -> None:
@@ -469,6 +506,190 @@ def scenario_misconfigured_credentials() -> None:
             os.environ[env_name] = original
 
 
+def scenario_rate_limit_isolation() -> None:
+    """按模型名分桶限流：primary 超限只影响 primary，不影响其他模型。"""
+    model_rate_limiter.configure(2, 60)
+    payload = {"model": "general-primary", "messages": [{"role": "user", "content": "hi"}]}
+    try:
+        for _ in range(2):
+            body = show_response(post("/v1/llm", payload))
+            check(body.get("content") == "fake completion text", "限流窗口内的请求应成功")
+        # 第 3 次触发 429 rate_limited
+        response = post("/v1/llm", payload)
+        body = show_response(response)
+        check(response.status_code == 429, f"超限请求状态码应为 429: {response.status_code}")
+        check(error_code(body) == "rate_limited", f"错误码应为 rate_limited: {error_code(body)}")
+        # 模型间隔离：backup / anthropic 不受 primary 超限影响
+        for model in ("general-backup", "anthropic-primary"):
+            body = show_response(post("/v1/llm", {"model": model, "messages": [{"role": "user", "content": "hi"}]}))
+            check(body.get("model") == model, f"{model} 不应受 primary 限流影响")
+        # 流式请求同样在入口被 429 拦截（SSE 开始前）
+        response = post("/v1/llm/stream", payload)
+        body = show_response(response)
+        check(response.status_code == 429, f"流式超限请求状态码应为 429: {response.status_code}")
+        check(error_code(body) == "rate_limited", f"流式错误码应为 rate_limited: {error_code(body)}")
+        # 流式到未超限的 backup 正常完成
+        response = post("/v1/llm/stream", {"model": "general-backup", "messages": [{"role": "user", "content": "hi"}]})
+        events = sse_events(response.text)
+        completed = [event for event in events if event.get("type") == "response.completed"]
+        check(
+            len(completed) == 1 and completed[0].get("model") == "general-backup",
+            "backup 流式调用不受 primary 限流影响",
+        )
+    finally:
+        model_rate_limiter.configure(DEFAULT_MAX_REQUESTS, DEFAULT_WINDOW_SECONDS)
+        model_rate_limiter.reset()
+
+
+def scenario_rate_limited_backup_not_bypassed() -> None:
+    """备用模型独立限流：backup 超限时，主模型失败后的降级不得绕过限流。"""
+    model_rate_limiter.configure(2, 60)
+    FAKE.always_fail.add(PRIMARY_MODEL)
+    try:
+        # 直接调用 backup 两次耗尽其桶
+        for _ in range(2):
+            body = show_response(post("/v1/llm", {"model": "general-backup", "messages": [{"role": "user", "content": "hi"}]}))
+            check(body.get("model") == "general-backup", "backup 桶内请求应成功")
+        # 第 3 次直接调用 backup → 429
+        response = post("/v1/llm", {"model": "general-backup", "messages": [{"role": "user", "content": "hi"}]})
+        check(response.status_code == 429, f"backup 超限应为 429: {response.status_code}")
+        # primary 失败后降级到已超限的 backup：不得绕过限流再调用
+        response = post("/v1/llm", {"model": "general-primary", "messages": [{"role": "user", "content": "hi"}]})
+        body = show_response(response)
+        check(response.status_code == 502, f"降级被限流时应为 502: {response.status_code}")
+        check(error_code(body) == "model_unavailable", f"错误码应为 model_unavailable: {error_code(body)}")
+        backup_calls = [call for call in FAKE.calls if not call["stream"] and call["model"] == BACKUP_MODEL]
+        check(len(backup_calls) == 2, f"backup 超限后不应再被降级调用: {len(backup_calls)}")
+    finally:
+        model_rate_limiter.configure(DEFAULT_MAX_REQUESTS, DEFAULT_WINDOW_SECONDS)
+        model_rate_limiter.reset()
+
+
+def scenario_native_structured_output() -> None:
+    """json_object/Responses 模式使用原生格式约束，而非仅提示词注入。"""
+    chat_provider = OpenAICompatibleProvider()
+    responses_provider = OpenAIResponsesProvider()
+    json_object_config = MODEL_CONFIGS["general-primary"]  # structured_output_mode=json_object
+    json_schema_config = ModelConfig(
+        provider_model="test-model",
+        base_url="https://example.com",
+        api_key_env="TEST_API_KEY",
+        supports_structured_output=True,
+        structured_output_mode="json_schema",
+    )
+    messages = [{"role": "user", "content": "结构化"}]
+
+    # chat json_object：原生 response_format + schema 通过 system 提示词传达
+    body = chat_provider._apply_structured_output(
+        json_object_config, {"model": "m", "messages": messages}, ANSWER_SCHEMA
+    )
+    show("chat json_object 请求体", body)
+    check(body.get("response_format") == {"type": "json_object"}, "chat json_object 应设置原生 response_format")
+    check(body["messages"][0]["role"] == "system", "chat json_object 应通过 system 提示词传达 schema")
+
+    # chat json_schema：原生 strict schema
+    body = chat_provider._apply_structured_output(
+        json_schema_config, {"model": "m", "messages": messages}, ANSWER_SCHEMA
+    )
+    check(
+        body.get("response_format", {}).get("type") == "json_schema"
+        and body["response_format"]["json_schema"]["strict"] is True,
+        "chat json_schema 应使用原生 strict schema",
+    )
+
+    # responses json_object：原生 text.format + instructions 传达 schema
+    body = responses_provider._apply_structured_output(
+        json_object_config, {"model": "m", "input": messages}, ANSWER_SCHEMA
+    )
+    show("responses json_object 请求体", body)
+    check(
+        body.get("text", {}).get("format") == {"type": "json_object"},
+        f"responses json_object 应设置原生 text.format: {body.get('text')}",
+    )
+    check("JSON Schema" in body.get("instructions", ""), "responses json_object 应通过 instructions 传达 schema")
+
+    # responses json_schema：原生 text.format json_schema，无提示词注入
+    body = responses_provider._apply_structured_output(
+        json_schema_config, {"model": "m", "input": messages}, ANSWER_SCHEMA
+    )
+    text_format = body.get("text", {}).get("format", {})
+    check(
+        text_format.get("type") == "json_schema" and text_format.get("strict") is True,
+        f"responses json_schema 应使用原生 text.format strict schema: {text_format}",
+    )
+    check("JSON Schema" not in body.get("instructions", ""), "responses json_schema 不应再注入提示词")
+
+
+async def _collect_stream(provider: Any, config: Any, sse: str, captured: dict) -> list[Any]:
+    """用 MockTransport 替换真实 HTTP，收集适配器流式输出（delta + 最终 Usage）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.read())
+        return httpx.Response(200, text=sse)
+
+    provider.create_client = lambda _: httpx.AsyncClient(
+        base_url="http://testserver", transport=httpx.MockTransport(handler)
+    )
+    items: list[Any] = []
+    async for item in provider.stream(config, [Message(role="user", content="hi")], 30.0):
+        items.append(item)
+    return items
+
+
+def scenario_stream_usage_parsing() -> None:
+    """真实适配器解析上游流式 usage（chat/responses/anthropic 三种协议），补齐流式 Token。"""
+
+    # chat/completions：请求携带 stream_options.include_usage，末块 usage 被解析
+    captured: dict = {}
+    chat_sse = "\n".join(
+        [
+            'data: {"choices": [{"delta": {"content": "Hel"}}]}',
+            'data: {"choices": [{"delta": {"content": "lo"}}]}',
+            'data: {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 5}}',
+            "data: [DONE]",
+        ]
+    )
+    items = asyncio.run(
+        _collect_stream(OpenAICompatibleProvider(), MODEL_CONFIGS["general-primary"], chat_sse, captured)
+    )
+    show("chat 流式输出", [str(item) for item in items])
+    check(captured["body"].get("stream_options") == {"include_usage": True}, "chat 流式请求应携带 stream_options.include_usage")
+    check([item for item in items if isinstance(item, str)] == ["Hel", "lo"], "chat 流式 delta 应被正确解析")
+    check(items[-1] == Usage(input_tokens=7, output_tokens=5), f"chat 流式应解析末块 usage: {items[-1]}")
+
+    # responses：response.completed 事件的 usage 被解析
+    captured = {}
+    responses_sse = "\n".join(
+        [
+            'data: {"type": "response.output_text.delta", "delta": "He"}',
+            'data: {"type": "response.output_text.delta", "delta": "y"}',
+            'data: {"type": "response.completed", "response": {"usage": {"input_tokens": 9, "output_tokens": 2}}}',
+        ]
+    )
+    items = asyncio.run(
+        _collect_stream(OpenAIResponsesProvider(), MODEL_CONFIGS["openai-responses"], responses_sse, captured)
+    )
+    show("responses 流式输出", [str(item) for item in items])
+    check([item for item in items if isinstance(item, str)] == ["He", "y"], "responses 流式 delta 应被正确解析")
+    check(items[-1] == Usage(input_tokens=9, output_tokens=2), f"responses 流式应解析 completed usage: {items[-1]}")
+
+    # anthropic：message_start 携带 input，message_delta 携带 output
+    captured = {}
+    anthropic_sse = "\n".join(
+        [
+            'data: {"type": "message_start", "message": {"usage": {"input_tokens": 4}}}',
+            'data: {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hi"}}',
+            'data: {"type": "message_delta", "usage": {"output_tokens": 2}}',
+        ]
+    )
+    items = asyncio.run(
+        _collect_stream(AnthropicProvider(), MODEL_CONFIGS["anthropic-primary"], anthropic_sse, captured)
+    )
+    show("anthropic 流式输出", [str(item) for item in items])
+    check([item for item in items if isinstance(item, str)] == ["Hi"], "anthropic 流式 delta 应被正确解析")
+    check(items[-1] == Usage(input_tokens=4, output_tokens=2), f"anthropic 流式应合并 usage: {items[-1]}")
+
+
 SCENARIOS: list[tuple[str, Callable[[], None]]] = [
     ("非流式基础调用", scenario_basic_complete),
     ("结构化输出成功", scenario_structured_output),
@@ -490,6 +711,10 @@ SCENARIOS: list[tuple[str, Callable[[], None]]] = [
     ("调用审计查询 (/v1/traces)", scenario_traces),
     ("供应商路由 (anthropic / openai_responses)", scenario_provider_routing),
     ("凭据未配置 (gateway_misconfigured)", scenario_misconfigured_credentials),
+    ("按模型名分桶限流与模型间隔离", scenario_rate_limit_isolation),
+    ("备用模型超限不被降级绕过", scenario_rate_limited_backup_not_bypassed),
+    ("原生结构化输出约束 (json_object / Responses)", scenario_native_structured_output),
+    ("真实适配器流式 usage 解析（三协议）", scenario_stream_usage_parsing),
 ]
 
 

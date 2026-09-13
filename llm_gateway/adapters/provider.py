@@ -39,7 +39,9 @@ class Provider(Protocol):
         config: ModelConfig,
         messages: list[Message],
         timeout_seconds: float,
-    ) -> AsyncIterator[str]: ...
+    ) -> AsyncIterator[str | Usage]:
+        """流式调用：依次 yield 非空 delta 字符串；流正常结束时最后 yield 一个 Usage。"""
+        ...
 
 
 def _json_instruction(response_schema: dict[str, Any]) -> str:
@@ -125,11 +127,35 @@ def _parse_chat_delta(line: str) -> str:
     return delta.get("content", "") or ""
 
 
+def _parse_chat_usage(line: str) -> Usage | None:
+    """chat/completions 流式 usage（需请求携带 stream_options.include_usage）。"""
+    data = _load_payload(line)
+    if not data or not data.get("usage"):
+        return None
+    raw = data["usage"]
+    return Usage(
+        input_tokens=int(raw.get("prompt_tokens", 0) or 0),
+        output_tokens=int(raw.get("completion_tokens", 0) or 0),
+    )
+
+
 def _parse_responses_delta(line: str) -> str:
     data = _load_payload(line)
     if not data or data.get("type") != "response.output_text.delta":
         return ""
     return data.get("delta", "") or ""
+
+
+def _parse_responses_usage(line: str) -> Usage | None:
+    """Responses API 流式 usage：``response.completed`` 事件的 ``response.usage``。"""
+    data = _load_payload(line)
+    if not data or data.get("type") != "response.completed":
+        return None
+    raw = (data.get("response") or {}).get("usage") or {}
+    return Usage(
+        input_tokens=int(raw.get("input_tokens", 0) or 0),
+        output_tokens=int(raw.get("output_tokens", 0) or 0),
+    )
 
 
 def _parse_anthropic_delta(line: str) -> str:
@@ -140,6 +166,20 @@ def _parse_anthropic_delta(line: str) -> str:
     if delta.get("type") != "text_delta":
         return ""
     return delta.get("text", "") or ""
+
+
+def _parse_anthropic_usage_event(line: str) -> tuple[str, int] | None:
+    """Anthropic 流式 usage：``message_start`` 携带 input，``message_delta`` 携带 output。"""
+    data = _load_payload(line)
+    if not data:
+        return None
+    if data.get("type") == "message_start":
+        raw = (data.get("message") or {}).get("usage") or {}
+        return "input", int(raw.get("input_tokens", 0) or 0)
+    if data.get("type") == "message_delta":
+        raw = data.get("usage") or {}
+        return "output", int(raw.get("output_tokens", 0) or 0)
+    return None
 
 
 class OpenAICompatibleProvider:
@@ -195,6 +235,9 @@ class OpenAICompatibleProvider:
                 },
             }
         else:
+            # json_object 模式：原生 response_format 约束输出为合法 JSON，
+            # schema 本身仍需通过 system 提示词传达（OpenAI json_object 语义）
+            body["response_format"] = {"type": "json_object"}
             body["messages"] = [
                 {"role": "system", "content": _json_instruction(response_schema)},
                 *body["messages"],
@@ -206,12 +249,14 @@ class OpenAICompatibleProvider:
         config: ModelConfig,
         messages: list[Message],
         timeout_seconds: float,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | Usage]:
         body: dict[str, Any] = {
             "model": config.provider_model,
             "messages": [message.model_dump() for message in messages],
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
+        usage = Usage(input_tokens=0, output_tokens=0)
         async with self.create_client(config) as client:
             async with client.stream(
                 "POST",
@@ -224,6 +269,10 @@ class OpenAICompatibleProvider:
                     delta = _parse_chat_delta(line)
                     if delta:
                         yield delta
+                    parsed_usage = _parse_chat_usage(line)
+                    if parsed_usage is not None:
+                        usage = parsed_usage
+        yield usage
 
 
 class OpenAIResponsesProvider(OpenAICompatibleProvider):
@@ -245,9 +294,22 @@ class OpenAIResponsesProvider(OpenAICompatibleProvider):
         body: dict[str, Any],
         response_schema: dict[str, Any],
     ) -> dict[str, Any]:
-        instruction = _json_instruction(response_schema)
-        existing = body.get("instructions")
-        body["instructions"] = f"{existing}\n\n{instruction}" if existing else instruction
+        # Responses API 原生格式约束：text.format，无需提示词注入
+        if config.structured_output_mode == "json_schema":
+            body["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "agent_response",
+                    "strict": True,
+                    "schema": response_schema,
+                }
+            }
+        else:
+            # json_object 模式：原生 text.format 约束输出为合法 JSON，schema 通过 instructions 传达
+            body["text"] = {"format": {"type": "json_object"}}
+            instruction = _json_instruction(response_schema)
+            existing = body.get("instructions")
+            body["instructions"] = f"{existing}\n\n{instruction}" if existing else instruction
         return body
 
     async def complete(
@@ -276,9 +338,10 @@ class OpenAIResponsesProvider(OpenAICompatibleProvider):
         config: ModelConfig,
         messages: list[Message],
         timeout_seconds: float,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | Usage]:
         body = self._base_body(config, messages)
         body["stream"] = True
+        usage = Usage(input_tokens=0, output_tokens=0)
         async with self.create_client(config) as client:
             async with client.stream(
                 "POST",
@@ -291,6 +354,10 @@ class OpenAIResponsesProvider(OpenAICompatibleProvider):
                     delta = _parse_responses_delta(line)
                     if delta:
                         yield delta
+                    parsed_usage = _parse_responses_usage(line)
+                    if parsed_usage is not None:
+                        usage = parsed_usage
+        yield usage
 
 
 class AnthropicProvider:
@@ -351,9 +418,10 @@ class AnthropicProvider:
         config: ModelConfig,
         messages: list[Message],
         timeout_seconds: float,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[str | Usage]:
         body = self._base_body(config, messages, None)
         body["stream"] = True
+        tokens: dict[str, int] = {"input": 0, "output": 0}
         async with self.create_client(config) as client:
             async with client.stream(
                 "POST",
@@ -366,6 +434,10 @@ class AnthropicProvider:
                     delta = _parse_anthropic_delta(line)
                     if delta:
                         yield delta
+                    usage_event = _parse_anthropic_usage_event(line)
+                    if usage_event is not None:
+                        tokens[usage_event[0]] = usage_event[1]
+        yield Usage(input_tokens=tokens["input"], output_tokens=tokens["output"])
 
 
 class ProviderDispatcher:
@@ -402,6 +474,6 @@ class ProviderDispatcher:
         config: ModelConfig,
         messages: list[Message],
         timeout_seconds: float,
-    ) -> AsyncIterator[str]:
-        async for delta in self._resolve(config).stream(config, messages, timeout_seconds):
-            yield delta
+    ) -> AsyncIterator[str | Usage]:
+        async for item in self._resolve(config).stream(config, messages, timeout_seconds):
+            yield item

@@ -15,6 +15,7 @@ from ..services.gateway import (
     stream_with_fallback,
     validate_model,
 )
+from ..services.rate_limiter import acquire_model_or_raise
 
 
 def build_router(provider: Provider | None = None) -> APIRouter:
@@ -31,6 +32,8 @@ def build_router(provider: Provider | None = None) -> APIRouter:
                 },
             )
         try:
+            validate_model(request.model, request.response_schema)
+            acquire_model_or_raise(request.model)
             return await call_with_fallback(request, provider=provider)
         except GatewayError as exc:
             raise HTTPException(
@@ -51,6 +54,8 @@ def build_router(provider: Provider | None = None) -> APIRouter:
         try:
             validate_model(request.model, None)
             build_messages(request)
+            # SSE 响应一旦开始便无法改写状态码，限流必须在下发前完成
+            acquire_model_or_raise(request.model)
         except GatewayError as exc:
             raise HTTPException(
                 status_code=exc.status_code,

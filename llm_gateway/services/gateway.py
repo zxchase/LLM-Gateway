@@ -25,6 +25,7 @@ from ..config import (
 )
 from ..errors import GatewayError
 from ..models import CallTrace, LLMRequest, LLMResponse, Message, PromptSelection, Usage
+from .rate_limiter import model_rate_limiter
 
 logger = logging.getLogger("llm_gateway")
 
@@ -72,6 +73,7 @@ def record_trace(
     attempts: int,
     status: Literal["success", "failed"],
     error_code: str | None = None,
+    ttft_ms: int | None = None,
 ) -> None:
     trace = CallTrace(
         request_id=request_id,
@@ -84,6 +86,7 @@ def record_trace(
         output_tokens=usage.output_tokens,
         cost_usd=calculate_cost(actual_model, usage) if actual_model else 0,
         latency_ms=latency_ms,
+        ttft_ms=ttft_ms,
         attempts=attempts,
         status=status,
         error_code=error_code,
@@ -139,6 +142,12 @@ async def call_with_fallback(
             if model_name == requested_model:
                 raise exc
             last_error = exc
+            continue
+
+        # 备用模型独立限流：超限时跳过降级，不绕过模型间隔离
+        # （请求方模型的名额已在路由层获取）
+        if model_name != requested_model and not model_rate_limiter.try_acquire(model_name):
+            last_error = GatewayError("rate_limited", f"备用模型 {model_name} 已限流", 429)
             continue
 
         for retry_number in range(MAX_ATTEMPTS_PER_MODEL):
@@ -219,12 +228,18 @@ async def stream_with_fallback(
     * 已向客户端下发过内容（emitted）后不再重试/降级，避免内容重复下发；
     * request_id 全程不变，审计只在最终成功/失败时记录一次；
     * messages 只构建一次，重试/降级复用同一输入。
+
+    流式观测：
+    * 首个非空 delta 到达时记录 TTFT（含重试/降级耗时，即客户端感知的首 token 时间）；
+    * 上游流式 usage 事件被解析，成功后随 response.completed 下发并写入审计。
     """
     provider = provider or DEFAULT_PROVIDER
     messages = build_messages(request)
     started = time.perf_counter()
     attempts = 0
     emitted = False
+    ttft_ms: int | None = None
+    stream_usage = Usage(input_tokens=0, output_tokens=0)
     last_error: Exception | None = None
     request_id = str(uuid4())
 
@@ -237,13 +252,25 @@ async def stream_with_fallback(
             last_error = exc
             continue
 
+        # 备用模型独立限流：超限时跳过降级，不绕过模型间隔离
+        # （请求方模型的名额已在路由层获取）
+        if model_name != request.model and not model_rate_limiter.try_acquire(model_name):
+            last_error = GatewayError("rate_limited", f"备用模型 {model_name} 已限流", 429)
+            continue
+
         stop_all = False
         for retry_number in range(MAX_ATTEMPTS_PER_MODEL):
             attempts += 1
             try:
-                async for delta in provider.stream(config, messages, request.timeout_seconds):
+                async for item in provider.stream(config, messages, request.timeout_seconds):
+                    if isinstance(item, Usage):
+                        # 上游在流结束时上报的用量统计
+                        stream_usage = item
+                        continue
+                    if ttft_ms is None:
+                        ttft_ms = int((time.perf_counter() - started) * 1000)
                     emitted = True
-                    yield encode_sse({"type": "content.delta", "delta": delta})
+                    yield encode_sse({"type": "content.delta", "delta": item})
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 if emitted or not is_retryable(exc):
@@ -260,12 +287,20 @@ async def stream_with_fallback(
                 request.model,
                 model_name,
                 request.prompt,
-                Usage(input_tokens=0, output_tokens=0),
+                stream_usage,
                 int((time.perf_counter() - started) * 1000),
                 attempts,
                 "success",
+                ttft_ms=ttft_ms,
             )
-            yield encode_sse({"type": "response.completed", "model": model_name})
+            yield encode_sse(
+                {
+                    "type": "response.completed",
+                    "model": model_name,
+                    "ttft_ms": ttft_ms,
+                    "usage": stream_usage.model_dump(),
+                }
+            )
             return
         if stop_all:
             break
@@ -276,11 +311,12 @@ async def stream_with_fallback(
         request.model,
         None,
         request.prompt,
-        Usage(input_tokens=0, output_tokens=0),
+        stream_usage,
         int((time.perf_counter() - started) * 1000),
         attempts,
         "failed",
         "upstream_stream_failed",
+        ttft_ms=ttft_ms,
     )
     yield encode_sse({"type": "response.failed", "error": "upstream_stream_failed"})
 

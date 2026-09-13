@@ -87,6 +87,7 @@ class CallTrace(BaseModel):
     output_tokens: int = Field(ge=0)
     cost_usd: float = Field(ge=0)
     latency_ms: int = Field(ge=0)
+    ttft_ms: int | None = Field(default=None, ge=0)  # 流式调用首个非空 delta 的时间
     attempts: int = Field(ge=0)
     status: Literal["success", "failed"]
     error_code: str | None = None
